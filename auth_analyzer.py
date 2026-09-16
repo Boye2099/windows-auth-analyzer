@@ -1,6 +1,23 @@
 import csv
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
+
+
+# ============================================================
+# WINDOWS AUTHENTICATION ANALYZER
+# ============================================================
+# A defensive security tool for analyzing Windows authentication
+# logs and identifying suspicious login patterns.
+#
+# Detects:
+# 1. Multiple failed login attempts
+# 2. Failed logins followed by a successful login
+# 3. Suspicious activity within a defined time window
+# 4. Logins outside normal working hours
+# 5. Authentication from multiple source IP addresses
+# 6. Privileged account activity
+# 7. Risk scoring based on multiple indicators
+# ============================================================
 
 
 # ============================================================
@@ -9,21 +26,22 @@ from datetime import datetime
 
 LOG_FILE = "auth_logs.csv"
 
-# Number of failed logins required before we consider
-# an account suspicious.
+# Minimum number of failed attempts required to trigger detection.
 FAILED_LOGIN_THRESHOLD = 3
 
-# Accounts that have elevated privileges.
-# In a real environment, this would come from AD.
+# Time window used for brute-force-style detection.
+FAILED_LOGIN_WINDOW = timedelta(minutes=5)
+
+# Normal working hours.
+NORMAL_START_HOUR = 8
+NORMAL_END_HOUR = 18
+
+# Accounts considered privileged in this training environment.
 PRIVILEGED_ACCOUNTS = {
     "admin",
     "administrator",
     "david"
 }
-
-# Normal working hours for this training environment.
-NORMAL_START_HOUR = 8
-NORMAL_END_HOUR = 18
 
 
 # ============================================================
@@ -42,16 +60,16 @@ source_ips = defaultdict(set)
 # ============================================================
 
 try:
-    with open(LOG_FILE, "r", newline="") as file:
+    with open(LOG_FILE, "r", newline="", encoding="utf-8") as file:
 
         reader = csv.DictReader(file)
 
         for row in reader:
 
-            # Convert the event ID from text to an integer.
+            # Convert Event ID from text into an integer.
             row["event_id"] = int(row["event_id"])
 
-            # Convert the timestamp into a Python datetime object.
+            # Convert timestamp into a datetime object.
             row["datetime"] = datetime.strptime(
                 row["time"],
                 "%Y-%m-%d %H:%M:%S"
@@ -60,13 +78,23 @@ try:
             events.append(row)
 
 except FileNotFoundError:
-    print(f"[ERROR] Could not find {LOG_FILE}")
-    print("Make sure auth_logs.csv is in the same folder.")
-    exit()
+
+    print(f"[ERROR] Could not find {LOG_FILE}.")
+    print("Make sure auth_logs.csv is in the same directory.")
+    raise SystemExit
 
 
 # ============================================================
-# ANALYZE EVENTS
+# SORT EVENTS
+# ============================================================
+
+# Sorting makes chronological analysis easier and ensures
+# detection logic processes events in the correct order.
+events.sort(key=lambda event: event["datetime"])
+
+
+# ============================================================
+# CLASSIFY EVENTS
 # ============================================================
 
 for event in events:
@@ -75,100 +103,102 @@ for event in events:
     source_ip = event["source_ip"]
     event_id = event["event_id"]
 
-    # Keep track of every IP address used by each account.
+    # Track all source IP addresses associated with an account.
     source_ips[username].add(source_ip)
 
-    # Event ID 4625 = failed Windows logon.
+    # Windows Event ID 4625 = failed logon.
     if event_id == 4625:
 
         failed_logins[username].append(event)
 
-    # Event ID 4624 = successful Windows logon.
+    # Windows Event ID 4624 = successful logon.
     elif event_id == 4624:
 
         successful_logins[username].append(event)
 
 
 # ============================================================
-# DISPLAY BASIC SUMMARY
+# HEADER
 # ============================================================
 
-print("\n" + "=" * 60)
+print("\n" + "=" * 65)
 print("WINDOWS AUTHENTICATION ANALYZER")
-print("=" * 60)
+print("=" * 65)
 
 print(f"\nTotal events analyzed: {len(events)}")
+print(f"Failed login threshold: {FAILED_LOGIN_THRESHOLD}")
+print("Failed login window: 5 minutes")
 
 
 # ============================================================
-# DETECTION 1 — MULTIPLE FAILED LOGINS
+# DETECTION 1
+# MULTIPLE FAILED LOGIN ATTEMPTS
 # ============================================================
 
 print("\n[1] MULTIPLE FAILED LOGIN DETECTION")
-print("-" * 60)
+print("-" * 65)
 
 for username, failures in failed_logins.items():
 
-    count = len(failures)
-
-    if count >= FAILED_LOGIN_THRESHOLD:
+    if len(failures) >= FAILED_LOGIN_THRESHOLD:
 
         print(
             f"[ALERT] {username} had "
-            f"{count} failed login attempts."
+            f"{len(failures)} failed login attempts."
         )
 
 
 # ============================================================
-# DETECTION 2 — FAILED LOGINS FOLLOWED BY SUCCESS
+# DETECTION 2
+# FAILED LOGINS FOLLOWED BY SUCCESS
+# WITHIN A TIME WINDOW
 # ============================================================
 
 print("\n[2] FAILED LOGINS FOLLOWED BY SUCCESS")
-print("-" * 60)
+print("-" * 65)
 
-for username, failures in failed_logins.items():
+for username, successes in successful_logins.items():
 
-    successes = successful_logins.get(username, [])
+    failures = failed_logins.get(username, [])
 
-    if not successes:
+    if not failures:
         continue
-
-    # Sort events chronologically.
-    failures.sort(key=lambda event: event["datetime"])
-    successes.sort(key=lambda event: event["datetime"])
 
     for success in successes:
 
-        failures_before_success = [
+        window_start = (
+            success["datetime"] - FAILED_LOGIN_WINDOW
+        )
+
+        recent_failures = [
             failure
             for failure in failures
-            if failure["datetime"] < success["datetime"]
+            if window_start <= failure["datetime"]
+            < success["datetime"]
         ]
 
-        if len(failures_before_success) >= FAILED_LOGIN_THRESHOLD:
+        if len(recent_failures) >= FAILED_LOGIN_THRESHOLD:
 
             print(
                 f"[ALERT] {username}: "
-                f"{len(failures_before_success)} failed "
-                f"logins followed by a successful login "
-                f"at {success['time']}."
+                f"{len(recent_failures)} failed logins "
+                f"followed by a successful login at "
+                f"{success['time']}."
             )
-
-            break
 
 
 # ============================================================
-# DETECTION 3 — UNUSUAL LOGIN HOURS
+# DETECTION 3
+# UNUSUAL LOGIN HOURS
 # ============================================================
 
 print("\n[3] UNUSUAL LOGIN TIME DETECTION")
-print("-" * 60)
+print("-" * 65)
 
 for event in events:
 
     hour = event["datetime"].hour
 
-    # Ignore normal working hours.
     if hour < NORMAL_START_HOUR or hour >= NORMAL_END_HOUR:
 
         print(
@@ -178,11 +208,12 @@ for event in events:
 
 
 # ============================================================
-# DETECTION 4 — MULTIPLE SOURCE IPs
+# DETECTION 4
+# MULTIPLE SOURCE IP ADDRESSES
 # ============================================================
 
 print("\n[4] MULTIPLE SOURCE IP DETECTION")
-print("-" * 60)
+print("-" * 65)
 
 for username, ips in source_ips.items():
 
@@ -193,29 +224,31 @@ for username, ips in source_ips.items():
             f"{len(ips)} different IP addresses:"
         )
 
-        for ip in ips:
+        for ip in sorted(ips):
             print(f"        - {ip}")
 
 
 # ============================================================
-# DETECTION 5 — PRIVILEGED ACCOUNT ACTIVITY
+# DETECTION 5
+# PRIVILEGED ACCOUNT ACTIVITY
 # ============================================================
 
 print("\n[5] PRIVILEGED ACCOUNT ACTIVITY")
-print("-" * 60)
+print("-" * 65)
+
+privileged_accounts_lower = {
+    account.lower()
+    for account in PRIVILEGED_ACCOUNTS
+}
 
 for event in events:
 
     username = event["username"]
 
-    if username.lower() in {
-        account.lower()
-        for account in PRIVILEGED_ACCOUNTS
-    }:
+    if username.lower() in privileged_accounts_lower:
 
         print(
-            f"[INFO] Privileged account activity: "
-            f"{username} | "
+            f"[INFO] {username} | "
             f"Event {event['event_id']} | "
             f"{event['time']} | "
             f"{event['source_ip']}"
@@ -223,107 +256,127 @@ for event in events:
 
 
 # ============================================================
-# DETECTION 6 — SIMPLE RISK SCORING
+# DETECTION 6
+# RISK SCORING
 # ============================================================
 
 print("\n[6] RISK SCORING")
-print("-" * 60)
+print("-" * 65)
 
 risk_scores = defaultdict(int)
+risk_reasons = defaultdict(list)
+
+
+# ------------------------------------------------------------
+# Indicator 1: Multiple failed logins
+# ------------------------------------------------------------
 
 for username, failures in failed_logins.items():
 
-    # Multiple failures increase risk.
     if len(failures) >= FAILED_LOGIN_THRESHOLD:
 
         risk_scores[username] += 30
 
-    # Many different IP addresses increase risk.
-    if len(source_ips[username]) > 1:
+        risk_reasons[username].append(
+            "multiple failed login attempts"
+        )
 
-        risk_scores[username] += 20
 
+# ------------------------------------------------------------
+# Indicator 2: Failed logins followed by success
+# ------------------------------------------------------------
 
-# Check successful logins occurring after multiple failures.
-for username, failures in failed_logins.items():
+for username, successes in successful_logins.items():
 
-    successes = successful_logins.get(username, [])
-
-    if not successes:
-        continue
+    failures = failed_logins.get(username, [])
 
     for success in successes:
 
-        failures_before_success = [
+        window_start = (
+            success["datetime"] - FAILED_LOGIN_WINDOW
+        )
+
+        recent_failures = [
             failure
             for failure in failures
-            if failure["datetime"] < success["datetime"]
+            if window_start <= failure["datetime"]
+            < success["datetime"]
         ]
 
-        if len(failures_before_success) >= FAILED_LOGIN_THRESHOLD:
+        if len(recent_failures) >= FAILED_LOGIN_THRESHOLD:
 
             risk_scores[username] += 30
+
+            risk_reasons[username].append(
+                "failed logins followed by successful login"
+            )
+
             break
 
 
-# Check unusual login times.
+# ------------------------------------------------------------
+# Indicator 3: Multiple source IP addresses
+# ------------------------------------------------------------
+
+for username, ips in source_ips.items():
+
+    if len(ips) > 1:
+
+        risk_scores[username] += 20
+
+        risk_reasons[username].append(
+            "authentication from multiple source IPs"
+        )
+
+
+# ------------------------------------------------------------
+# Indicator 4: Unusual login hours
+# ------------------------------------------------------------
+
+unusual_time_users = set()
+
 for event in events:
 
     hour = event["datetime"].hour
 
     if hour < NORMAL_START_HOUR or hour >= NORMAL_END_HOUR:
 
-        risk_scores[event["username"]] += 10
+        unusual_time_users.add(event["username"])
 
 
-# Privileged accounts receive additional attention.
-for username in risk_scores:
+for username in unusual_time_users:
 
-    if username.lower() in {
-        account.lower()
-        for account in PRIVILEGED_ACCOUNTS
-    }:
+    risk_scores[username] += 10
+
+    risk_reasons[username].append(
+        "login outside normal working hours"
+    )
+
+
+# ------------------------------------------------------------
+# Indicator 5: Privileged account
+# ------------------------------------------------------------
+
+for username in list(risk_scores.keys()):
+
+    if username.lower() in privileged_accounts_lower:
 
         risk_scores[username] += 20
+
+        risk_reasons[username].append(
+            "privileged account activity"
+        )
 
 
 # ============================================================
 # DISPLAY RISK SCORES
 # ============================================================
 
-for username, score in sorted(
-    risk_scores.items(),
-    key=lambda item: item[1],
-    reverse=True
-):
-
-    if score >= 70:
-        severity = "HIGH"
-
-    elif score >= 40:
-        severity = "MEDIUM"
-
-    else:
-        severity = "LOW"
-
-    print(
-        f"{username:<15} "
-        f"Score: {score:<3} "
-        f"Severity: {severity}"
-    )
-
-
-# ============================================================
-# INVESTIGATION SUMMARY
-# ============================================================
-
-print("\n" + "=" * 60)
-print("INVESTIGATION SUMMARY")
-print("=" * 60)
+print("\nRisk assessment:")
 
 if not risk_scores:
 
-    print("\nNo suspicious authentication patterns detected.")
+    print("No suspicious authentication patterns detected.")
 
 else:
 
@@ -333,27 +386,73 @@ else:
         reverse=True
     ):
 
+        if score >= 70:
+            severity = "HIGH"
+
+        elif score >= 40:
+            severity = "MEDIUM"
+
+        else:
+            severity = "LOW"
+
         print(
-            f"\nAccount: {username}"
+            f"\n{username}"
+            f"\n  Risk Score: {score}"
+            f"\n  Severity: {severity}"
+        )
+
+        print("  Indicators:")
+
+        for reason in dict.fromkeys(risk_reasons[username]):
+            print(f"    - {reason}")
+
+
+# ============================================================
+# INVESTIGATION SUMMARY
+# ============================================================
+
+print("\n" + "=" * 65)
+print("INVESTIGATION SUMMARY")
+print("=" * 65)
+
+if not risk_scores:
+
+    print("\nNo accounts require further investigation.")
+
+else:
+
+    for username, score in sorted(
+        risk_scores.items(),
+        key=lambda item: item[1],
+        reverse=True
+    ):
+
+        print(f"\nAccount: {username}")
+        print(f"Risk score: {score}")
+
+        print(
+            "Source IPs: "
+            + ", ".join(sorted(source_ips[username]))
         )
 
         print(
-            f"Risk score: {score}"
+            "Failed logins: "
+            + str(len(failed_logins.get(username, [])))
         )
 
         print(
-            f"Source IPs: "
-            f"{', '.join(source_ips[username])}"
+            "Successful logins: "
+            + str(len(successful_logins.get(username, [])))
         )
 
-        print(
-            f"Failed logins: "
-            f"{len(failed_logins.get(username, []))}"
-        )
+        print("Investigation indicators:")
 
-        print(
-            f"Successful logins: "
-            f"{len(successful_logins.get(username, []))}"
-        )
+        for reason in dict.fromkeys(risk_reasons[username]):
+            print(f"  - {reason}")
+
+
+# ============================================================
+# COMPLETION
+# ============================================================
 
 print("\nAnalysis complete.")
